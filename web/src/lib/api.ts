@@ -8,7 +8,11 @@ import type {
   AuthResponse,
   Category,
   InstanceFormData,
+  InstanceCapabilities,
   InstanceResponse,
+  TorrentCreationParams,
+  TorrentCreationTask,
+  TorrentCreationTaskResponse,
   TorrentResponse,
   User
 } from "@/types"
@@ -31,7 +35,10 @@ class ApiClient {
     })
 
     if (!response.ok) {
-      if (response.status === 401 && !window.location.pathname.startsWith(withBasePath("/login")) && !window.location.pathname.startsWith(withBasePath("/setup"))) {
+      // Don't auto-redirect for auth check endpoints - let React Router handle navigation
+      const isAuthCheckEndpoint = endpoint === "/auth/me" || endpoint === "/auth/validate"
+
+      if (response.status === 401 && !isAuthCheckEndpoint && !window.location.pathname.startsWith(withBasePath("/login")) && !window.location.pathname.startsWith(withBasePath("/setup"))) {
         window.location.href = withBasePath("/login")
         throw new Error("Session expired")
       }
@@ -95,6 +102,35 @@ class ApiClient {
     return this.request("/auth/logout", { method: "POST" })
   }
 
+  async validate(): Promise<{
+    username: string
+    auth_method?: string
+    profile_picture?: string
+  }> {
+    return this.request("/auth/validate")
+  }
+
+  async getOIDCConfig(): Promise<{
+    enabled: boolean
+    authorizationUrl: string
+    state: string
+    disableBuiltInLogin: boolean
+    issuerUrl: string
+  }> {
+    try {
+      return await this.request("/auth/oidc/config")
+    } catch {
+      // Return default config if OIDC is not configured
+      return {
+        enabled: false,
+        authorizationUrl: "",
+        state: "",
+        disableBuiltInLogin: false,
+        issuerUrl: "",
+      }
+    }
+  }
+
   // Instance endpoints
   async getInstances(): Promise<InstanceResponse[]> {
     return this.request<InstanceResponse[]>("/instances")
@@ -123,6 +159,10 @@ class ApiClient {
 
   async testConnection(id: number): Promise<{ connected: boolean; message: string }> {
     return this.request(`/instances/${id}/test`, { method: "POST" })
+  }
+
+  async getInstanceCapabilities(id: number): Promise<InstanceCapabilities> {
+    return this.request<InstanceCapabilities>(`/instances/${id}/capabilities`)
   }
 
 
@@ -224,7 +264,7 @@ class ApiClient {
     instanceId: number,
     data: {
       hashes: string[]
-      action: "pause" | "resume" | "delete" | "recheck" | "reannounce" | "increasePriority" | "decreasePriority" | "topPriority" | "bottomPriority" | "setCategory" | "addTags" | "removeTags" | "setTags" | "toggleAutoTMM" | "setShareLimit" | "setUploadLimit" | "setDownloadLimit"
+      action: "pause" | "resume" | "delete" | "recheck" | "reannounce" | "increasePriority" | "decreasePriority" | "topPriority" | "bottomPriority" | "setCategory" | "addTags" | "removeTags" | "setTags" | "toggleAutoTMM" | "setShareLimit" | "setUploadLimit" | "setDownloadLimit" | "setLocation" | "editTrackers" | "addTrackers" | "removeTrackers"
       deleteFiles?: boolean
       category?: string
       tags?: string  // Comma-separated tags string
@@ -243,6 +283,10 @@ class ApiClient {
       inactiveSeedingTimeLimit?: number  // For setShareLimit action (minutes)
       uploadLimit?: number  // For setUploadLimit action (KB/s)
       downloadLimit?: number  // For setDownloadLimit action (KB/s)
+      location?: string  // For setLocation action
+      trackerOldURL?: string  // For editTrackers action
+      trackerNewURL?: string  // For editTrackers action
+      trackerURLs?: string  // For addTrackers/removeTrackers actions (newline-separated)
     }
   ): Promise<void> {
     return this.request(`/instances/${instanceId}/torrents/bulk-action`, {
@@ -260,8 +304,64 @@ class ApiClient {
     return this.request(`/instances/${instanceId}/torrents/${hash}/trackers`)
   }
 
+  async editTorrentTracker(instanceId: number, hash: string, oldURL: string, newURL: string): Promise<void> {
+    return this.request(`/instances/${instanceId}/torrents/${hash}/trackers`, {
+      method: "PUT",
+      body: JSON.stringify({ oldURL, newURL }),
+    })
+  }
+
+  async addTorrentTrackers(instanceId: number, hash: string, urls: string): Promise<void> {
+    return this.request(`/instances/${instanceId}/torrents/${hash}/trackers`, {
+      method: "POST",
+      body: JSON.stringify({ urls }),
+    })
+  }
+
+  async removeTorrentTrackers(instanceId: number, hash: string, urls: string): Promise<void> {
+    return this.request(`/instances/${instanceId}/torrents/${hash}/trackers`, {
+      method: "DELETE",
+      body: JSON.stringify({ urls }),
+    })
+  }
+
   async getTorrentFiles(instanceId: number, hash: string): Promise<any[]> {
     return this.request(`/instances/${instanceId}/torrents/${hash}/files`)
+  }
+
+  async exportTorrent(instanceId: number, hash: string): Promise<{ blob: Blob; filename: string | null }> {
+    const encodedHash = encodeURIComponent(hash)
+    const response = await fetch(`${API_BASE}/instances/${instanceId}/torrents/${encodedHash}/export`, {
+      method: "GET",
+      credentials: "include",
+    })
+
+    if (!response.ok) {
+      if (response.status === 401 && !window.location.pathname.startsWith(withBasePath("/login")) && !window.location.pathname.startsWith(withBasePath("/setup"))) {
+        window.location.href = withBasePath("/login")
+        throw new Error("Session expired")
+      }
+
+      let errorMessage = `HTTP error! status: ${response.status}`
+      try {
+        const errorData = await response.json()
+        errorMessage = errorData.error || errorData.message || errorMessage
+      } catch {
+        try {
+          const errorText = await response.text()
+          errorMessage = errorText || errorMessage
+        } catch {
+          // nothing to see here
+        }
+      }
+      throw new Error(errorMessage)
+    }
+
+    const blob = await response.blob()
+    const disposition = response.headers.get("content-disposition")
+    const filename = parseContentDispositionFilename(disposition)
+
+    return { blob, filename }
   }
 
   async getTorrentPeers(instanceId: number, hash: string): Promise<any> {
@@ -279,6 +379,65 @@ class ApiClient {
     return this.request(`/instances/${instanceId}/torrents/ban-peers`, {
       method: "POST",
       body: JSON.stringify({ peers }),
+    })
+  }
+
+  // Torrent Creator
+  async createTorrent(instanceId: number, params: TorrentCreationParams): Promise<TorrentCreationTaskResponse> {
+    return this.request(`/instances/${instanceId}/torrent-creator`, {
+      method: "POST",
+      body: JSON.stringify(params),
+    })
+  }
+
+  async getTorrentCreationTasks(instanceId: number, taskID?: string): Promise<TorrentCreationTask[]> {
+    const query = taskID ? `?taskID=${encodeURIComponent(taskID)}` : ""
+    return this.request(`/instances/${instanceId}/torrent-creator/status${query}`)
+  }
+
+  async getActiveTaskCount(instanceId: number): Promise<number> {
+    const response = await this.request<{ count: number }>(`/instances/${instanceId}/torrent-creator/count`)
+    return response.count
+  }
+
+  async downloadTorrentFile(instanceId: number, taskID: string): Promise<void> {
+    const response = await fetch(
+      `${API_BASE}/instances/${instanceId}/torrent-creator/${encodeURIComponent(taskID)}/file`,
+      {
+        method: "GET",
+        credentials: "include",
+      }
+    )
+
+    if (!response.ok) {
+      throw new Error(`Failed to download torrent file: ${response.statusText}`)
+    }
+
+    // Get filename from Content-Disposition header
+    const contentDisposition = response.headers.get("Content-Disposition")
+    let filename = `${taskID}.torrent`
+    if (contentDisposition) {
+      const filenameMatch = contentDisposition.match(/filename="?([^";]+)"?/)
+      if (filenameMatch) {
+        filename = filenameMatch[1]
+      }
+    }
+
+    // Create blob and download
+    const blob = await response.blob()
+    const url = window.URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    window.URL.revokeObjectURL(url)
+  }
+
+  async deleteTorrentCreationTask(instanceId: number, taskID: string): Promise<{ message: string }> {
+    return this.request(`/instances/${instanceId}/torrent-creator/${encodeURIComponent(taskID)}`, {
+      method: "DELETE",
     })
   }
 
@@ -324,6 +483,10 @@ class ApiClient {
       method: "DELETE",
       body: JSON.stringify({ tags }),
     })
+  }
+
+  async getActiveTrackers(instanceId: number): Promise<Record<string, string>> {
+    return this.request(`/instances/${instanceId}/trackers`)
   }
 
   // User endpoints
@@ -389,7 +552,6 @@ class ApiClient {
       host: string
     }
     proxyUrl: string
-    instructions: string
   }> {
     return this.request("/client-api-keys", {
       method: "POST",
@@ -401,40 +563,52 @@ class ApiClient {
     return this.request(`/client-api-keys/${id}`, { method: "DELETE" })
   }
 
-  // Theme License endpoints
-  async validateThemeLicense(licenseKey: string): Promise<{
+  // License endpoints
+  async activateLicense(licenseKey: string): Promise<{
     valid: boolean
-    themeName?: string
     expiresAt?: string
     message?: string
     error?: string
   }> {
-    return this.request("/themes/license/validate", {
+    return this.request("/license/activate", {
+      method: "POST",
+      body: JSON.stringify({ licenseKey }),
+    })
+  }
+
+  async validateLicense(licenseKey: string): Promise<{
+    valid: boolean
+    productName?: string
+    expiresAt?: string
+    message?: string
+    error?: string
+  }> {
+    return this.request("/license/validate", {
       method: "POST",
       body: JSON.stringify({ licenseKey }),
     })
   }
 
   async getLicensedThemes(): Promise<{ hasPremiumAccess: boolean }> {
-    return this.request("/themes/licensed")
+    return this.request("/license/licensed")
   }
 
   async getAllLicenses(): Promise<Array<{
     licenseKey: string
-    themeName: string
+    productName: string
     status: string
     createdAt: string
   }>> {
-    return this.request("/themes/licenses")
+    return this.request("/license/licenses")
   }
 
 
-  async deleteThemeLicense(licenseKey: string): Promise<{ message: string }> {
-    return this.request(`/themes/license/${licenseKey}`, { method: "DELETE" })
+  async deleteLicense(licenseKey: string): Promise<{ message: string }> {
+    return this.request(`/license/${licenseKey}`, { method: "DELETE" })
   }
 
-  async refreshThemeLicenses(): Promise<{ message: string }> {
-    return this.request("/themes/license/refresh", { method: "POST" })
+  async refreshLicenses(): Promise<{ message: string }> {
+    return this.request("/license/refresh", { method: "POST" })
   }
 
   // Preferences endpoints
@@ -461,6 +635,54 @@ class ApiClient {
       method: "POST",
     })
   }
+
+  async getLatestVersion(): Promise<{
+    tag_name: string
+    name?: string
+    html_url: string
+    published_at: string
+  } | null> {
+    try {
+      const response = await this.request<{
+        tag_name: string
+        name?: string
+        html_url: string
+        published_at: string
+      } | null>("/version/latest")
+
+      // Treat empty responses as no update available
+      return response ?? null
+    } catch {
+      // Return null if no update available (204 status) or any error
+      return null
+    }
+  }
+
+  async getTrackerIcons(): Promise<Record<string, string>> {
+    return this.request<Record<string, string>>("/tracker-icons")
+  }
 }
 
 export const api = new ApiClient()
+
+function parseContentDispositionFilename(header: string | null): string | null {
+  if (!header) {
+    return null
+  }
+
+  const utf8Match = header.match(/filename\*=UTF-8''([^;]+)/i)
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1])
+    } catch {
+      return utf8Match[1]
+    }
+  }
+
+  const quotedMatch = header.match(/filename="?([^";]+)"?/i)
+  if (quotedMatch?.[1]) {
+    return quotedMatch[1]
+  }
+
+  return null
+}

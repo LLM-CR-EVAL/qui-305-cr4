@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
-import { useNavigate } from "@tanstack/react-router"
 import { api } from "@/lib/api"
 import type { User } from "@/types"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useNavigate } from "@tanstack/react-router"
 
 export function useAuth() {
   const navigate = useNavigate()
@@ -46,6 +46,15 @@ export function useAuth() {
     },
   })
 
+  const setIsAuthenticated = (authenticated: boolean) => {
+    if (authenticated) {
+      // Force refetch of user data
+      queryClient.invalidateQueries({ queryKey: ["auth", "user"] })
+    } else {
+      queryClient.setQueryData(["auth", "user"], null)
+    }
+  }
+
   return {
     user: user as User | undefined,
     isAuthenticated: !!user,
@@ -58,5 +67,6 @@ export function useAuth() {
     isSettingUp: setupMutation.isPending,
     loginError: loginMutation.error,
     setupError: setupMutation.error,
+    setIsAuthenticated,
   }
 }

@@ -6,14 +6,11 @@ package qbittorrent
 import (
 	"context"
 	"fmt"
-	"maps"
-	"net/http"
-	"reflect"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/Masterminds/semver/v3"
+	"github.com/autobrr/autobrr/pkg/ttlcache"
 	qbt "github.com/autobrr/go-qbittorrent"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
@@ -21,29 +18,33 @@ import (
 
 type Client struct {
 	*qbt.Client
-	instanceID      int
-	webAPIVersion   string
-	supportsSetTags bool
-	lastHealthCheck time.Time
-	isHealthy       bool
-	syncManager     *qbt.SyncManager
-	peerSyncManager map[string]*qbt.PeerSyncManager // Map of torrent hash to PeerSyncManager
+	instanceID              int
+	webAPIVersion           string
+	supportsSetTags         bool
+	supportsTorrentCreation bool
+	supportsTrackerEditing  bool
+	lastHealthCheck         time.Time
+	isHealthy               bool
+	syncManager             *qbt.SyncManager
+	peerSyncManager         map[string]*qbt.PeerSyncManager // Map of torrent hash to PeerSyncManager
 	// optimisticUpdates stores temporary optimistic state changes for this instance
-	optimisticUpdates map[string]*OptimisticTorrentUpdate
+	optimisticUpdates *ttlcache.Cache[string, *OptimisticTorrentUpdate]
+	trackerExclusions map[string]map[string]struct{} // Domains to hide hashes from until fresh sync arrives
 	mu                sync.RWMutex
 	healthMu          sync.RWMutex
 }
 
-func NewClient(instanceID int, instanceHost, username, password string, basicUsername, basicPassword *string) (*Client, error) {
-	return NewClientWithTimeout(instanceID, instanceHost, username, password, basicUsername, basicPassword, 60*time.Second)
+func NewClient(instanceID int, instanceHost, username, password string, basicUsername, basicPassword *string, tlsSkipVerify bool) (*Client, error) {
+	return NewClientWithTimeout(instanceID, instanceHost, username, password, basicUsername, basicPassword, tlsSkipVerify, 60*time.Second)
 }
 
-func NewClientWithTimeout(instanceID int, instanceHost, username, password string, basicUsername, basicPassword *string, timeout time.Duration) (*Client, error) {
+func NewClientWithTimeout(instanceID int, instanceHost, username, password string, basicUsername, basicPassword *string, tlsSkipVerify bool, timeout time.Duration) (*Client, error) {
 	cfg := qbt.Config{
-		Host:     instanceHost,
-		Username: username,
-		Password: password,
-		Timeout:  int(timeout.Seconds()),
+		Host:          instanceHost,
+		Username:      username,
+		Password:      password,
+		Timeout:       int(timeout.Seconds()),
+		TLSSkipVerify: tlsSkipVerify,
 	}
 
 	if basicUsername != nil && *basicUsername != "" {
@@ -68,21 +69,33 @@ func NewClientWithTimeout(instanceID int, instanceHost, username, password strin
 	}
 
 	supportsSetTags := false
+	supportsTorrentCreation := false
+	supportsTrackerEditing := false
 	if webAPIVersion != "" {
 		if v, err := semver.NewVersion(webAPIVersion); err == nil {
-			minVersion := semver.MustParse("2.11.4")
-			supportsSetTags = !v.LessThan(minVersion)
+			setTagsMinVersion := semver.MustParse("2.11.4")
+			supportsSetTags = !v.LessThan(setTagsMinVersion)
+
+			torrentCreationMinVersion := semver.MustParse("2.11.2")
+			supportsTorrentCreation = !v.LessThan(torrentCreationMinVersion)
+
+			trackerEditingMinVersion := semver.MustParse("2.2.0")
+			supportsTrackerEditing = !v.LessThan(trackerEditingMinVersion)
 		}
 	}
 
 	client := &Client{
-		Client:            qbtClient,
-		instanceID:        instanceID,
-		webAPIVersion:     webAPIVersion,
-		supportsSetTags:   supportsSetTags,
-		lastHealthCheck:   time.Now(),
-		isHealthy:         true,
-		optimisticUpdates: make(map[string]*OptimisticTorrentUpdate),
+		Client:                  qbtClient,
+		instanceID:              instanceID,
+		webAPIVersion:           webAPIVersion,
+		supportsSetTags:         supportsSetTags,
+		supportsTorrentCreation: supportsTorrentCreation,
+		supportsTrackerEditing:  supportsTrackerEditing,
+		lastHealthCheck:         time.Now(),
+		isHealthy:               true,
+		optimisticUpdates: ttlcache.New(ttlcache.Options[string, *OptimisticTorrentUpdate]{}.
+			SetDefaultTTL(30 * time.Second)), // Updates expire after 30 seconds
+		trackerExclusions: make(map[string]map[string]struct{}),
 		peerSyncManager:   make(map[string]*qbt.PeerSyncManager),
 	}
 
@@ -103,12 +116,26 @@ func NewClientWithTimeout(instanceID int, instanceHost, username, password strin
 
 	client.syncManager = qbtClient.NewSyncManager(syncOpts)
 
+	supportsInclude := client.supportsTrackerInclude()
+
 	log.Debug().
 		Int("instanceID", instanceID).
 		Str("host", instanceHost).
 		Str("webAPIVersion", webAPIVersion).
 		Bool("supportsSetTags", supportsSetTags).
+		Bool("supportsTorrentCreation", supportsTorrentCreation).
+		Bool("supportsTrackerEditing", supportsTrackerEditing).
+		Bool("includeTrackers", supportsInclude).
+		Bool("tlsSkipVerify", tlsSkipVerify).
 		Msg("qBittorrent client created successfully")
+
+	if !supportsInclude {
+		log.Debug().
+			Int("instanceID", instanceID).
+			Str("host", instanceHost).
+			Str("webAPIVersion", webAPIVersion).
+			Msg("qBittorrent instance does not support includeTrackers; using fallback tracker queries for status detection")
+	}
 
 	return client, nil
 }
@@ -145,6 +172,18 @@ func (c *Client) IsHealthy() bool {
 	return c.isHealthy
 }
 
+func (c *Client) SupportsTorrentCreation() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.supportsTorrentCreation
+}
+
+func (c *Client) SupportsTrackerEditing() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.supportsTrackerEditing
+}
+
 // getTorrentsByHashes returns multiple torrents by their hashes (O(n) where n is number of requested hashes)
 func (c *Client) getTorrentsByHashes(hashes []string) []qbt.Torrent {
 	c.mu.RLock()
@@ -178,49 +217,56 @@ func (c *Client) SupportsSetTags() bool {
 	return c.supportsSetTags
 }
 
+func (c *Client) SupportsTrackerHealth() bool {
+	return c.supportsTrackerInclude()
+}
+
 func (c *Client) GetWebAPIVersion() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.webAPIVersion
 }
 
-// GetHTTPClient allows you to receive the implemented *http.Client with cookie jar
-// This method uses reflection to access the private http field from the embedded qbt.Client
-//
-// TODO: Remove this method and update proxy handler when go-qbittorrent merges GetHTTPClient method
-// When https://github.com/autobrr/go-qbittorrent is updated with GetHTTPClient method:
-// 1. Remove this entire GetHTTPClient method from qui's Client wrapper
-// 2. Update proxy handler to call client.Client.GetHTTPClient() directly instead of client.GetHTTPClient()
-// 3. Remove "reflect" and "unsafe" imports from this file
-// 4. Update go.mod to use the new version of go-qbittorrent
-func (c *Client) GetHTTPClient() *http.Client {
-	// Use reflection to access the private 'http' field from the embedded qbt.Client
-	clientValue := reflect.ValueOf(c.Client).Elem()
-	httpField := clientValue.FieldByName("http")
-
-	if !httpField.IsValid() {
-		log.Error().Msg("Failed to access http field from qBittorrent client")
-		return nil
-	}
-
-	// The field is unexported, so we need to make it accessible
-	if !httpField.CanInterface() {
-		// Make the field accessible using reflection
-		httpField = reflect.NewAt(httpField.Type(), unsafe.Pointer(httpField.UnsafeAddr())).Elem()
-	}
-
-	if httpClient, ok := httpField.Interface().(*http.Client); ok {
-		return httpClient
-	}
-
-	log.Error().Msg("Failed to convert http field to *http.Client")
-	return nil
-}
-
 func (c *Client) GetSyncManager() *qbt.SyncManager {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.syncManager
+}
+
+func (c *Client) trackerManager() *qbt.TrackerManager {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.syncManager == nil {
+		return nil
+	}
+	return c.syncManager.Trackers()
+}
+
+func (c *Client) supportsTrackerInclude() bool {
+	if tm := c.trackerManager(); tm != nil {
+		return tm.SupportsIncludeTrackers()
+	}
+	return false
+}
+
+func (c *Client) hydrateTorrentsWithTrackers(ctx context.Context, torrents []qbt.Torrent, allowFetch bool) ([]qbt.Torrent, map[string][]qbt.TorrentTracker, []string, error) {
+	tm := c.trackerManager()
+	if tm == nil {
+		return torrents, nil, nil, fmt.Errorf("tracker manager unavailable")
+	}
+
+	opts := make([]qbt.TrackerHydrateOption, 0, 2)
+	if !allowFetch {
+		opts = append(opts, qbt.WithTrackerAllowFetch(false))
+	}
+
+	return tm.HydrateTorrents(ctx, torrents, opts...)
+}
+
+func (c *Client) invalidateTrackerCache(hashes ...string) {
+	if tm := c.trackerManager(); tm != nil {
+		tm.Invalidate(hashes...)
+	}
 }
 
 func (c *Client) StartSyncManager(ctx context.Context) error {
@@ -253,9 +299,6 @@ func (c *Client) GetOrCreatePeerSyncManager(hash string) *qbt.PeerSyncManager {
 
 // applyOptimisticCacheUpdate applies optimistic updates for the given hashes and action
 func (c *Client) applyOptimisticCacheUpdate(hashes []string, action string, _ map[string]any) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	log.Debug().Int("instanceID", c.instanceID).Str("action", action).Int("hashCount", len(hashes)).Msg("Starting optimistic cache update")
 
 	now := time.Now()
@@ -264,43 +307,132 @@ func (c *Client) applyOptimisticCacheUpdate(hashes []string, action string, _ ma
 	for _, hash := range hashes {
 		var originalState qbt.TorrentState
 		var progress float64
+
+		// Need mutex only for syncManager access
+		c.mu.RLock()
 		if c.syncManager != nil {
 			if torrent, exists := c.syncManager.GetTorrent(hash); exists {
 				originalState = torrent.State
 				progress = torrent.Progress
 			}
 		}
+		c.mu.RUnlock()
+
 		state := getTargetState(action, progress)
 		if state != "" && state != originalState {
-			c.optimisticUpdates[hash] = &OptimisticTorrentUpdate{
+			c.optimisticUpdates.Set(hash, &OptimisticTorrentUpdate{
 				State:         state,
 				OriginalState: originalState,
 				UpdatedAt:     now,
 				Action:        action,
-			}
+			}, 30*time.Second)
 			log.Debug().Int("instanceID", c.instanceID).Str("hash", hash).Str("action", action).Msg("Created optimistic update for " + action)
 		}
 	}
 
-	log.Debug().Int("instanceID", c.instanceID).Str("action", action).Int("hashCount", len(hashes)).Int("totalOptimistic", len(c.optimisticUpdates)).Msg("Completed optimistic cache update")
+	log.Debug().Int("instanceID", c.instanceID).Str("action", action).Int("hashCount", len(hashes)).Msg("Completed optimistic cache update")
 }
 
-// getOptimisticUpdates returns a copy of the current optimistic updates
-func (c *Client) getOptimisticUpdates() map[string]*OptimisticTorrentUpdate {
+// addTrackerExclusions records hashes that should be temporarily excluded from a tracker domain.
+func (c *Client) addTrackerExclusions(domain string, hashes []string) {
+	if domain == "" || len(hashes) == 0 {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	set, ok := c.trackerExclusions[domain]
+	if !ok {
+		set = make(map[string]struct{})
+		c.trackerExclusions[domain] = set
+	}
+
+	for _, hash := range hashes {
+		if hash == "" {
+			continue
+		}
+		set[hash] = struct{}{}
+	}
+}
+
+// removeTrackerExclusions removes specific hashes from the exclusion map for a domain.
+// If no hashes are provided, the entire domain entry is cleared.
+func (c *Client) removeTrackerExclusions(domain string, hashes []string) {
+	if domain == "" {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(hashes) == 0 {
+		delete(c.trackerExclusions, domain)
+		return
+	}
+
+	set, ok := c.trackerExclusions[domain]
+	if !ok {
+		return
+	}
+
+	for _, hash := range hashes {
+		delete(set, hash)
+	}
+
+	if len(set) == 0 {
+		delete(c.trackerExclusions, domain)
+	}
+}
+
+// getTrackerExclusionsCopy returns a deep copy of tracker exclusions for safe iteration.
+func (c *Client) getTrackerExclusionsCopy() map[string]map[string]struct{} {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	// Return a copy to prevent external modification
-	updates := make(map[string]*OptimisticTorrentUpdate, len(c.optimisticUpdates))
-	maps.Copy(updates, c.optimisticUpdates)
+	if len(c.trackerExclusions) == 0 {
+		return nil
+	}
+
+	copyMap := make(map[string]map[string]struct{}, len(c.trackerExclusions))
+	for domain, hashes := range c.trackerExclusions {
+		inner := make(map[string]struct{}, len(hashes))
+		for hash := range hashes {
+			inner[hash] = struct{}{}
+		}
+		copyMap[domain] = inner
+	}
+	return copyMap
+}
+
+// clearTrackerExclusions removes domains from the temporary exclusion map.
+func (c *Client) clearTrackerExclusions(domains []string) {
+	if len(domains) == 0 {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, domain := range domains {
+		delete(c.trackerExclusions, domain)
+	}
+}
+
+// getOptimisticUpdates returns all current optimistic updates
+func (c *Client) getOptimisticUpdates() map[string]*OptimisticTorrentUpdate {
+	updates := make(map[string]*OptimisticTorrentUpdate)
+	for _, key := range c.optimisticUpdates.GetKeys() {
+		if val, found := c.optimisticUpdates.Get(key); found {
+			updates[key] = val
+		}
+	}
 	return updates
 }
 
 // clearOptimisticUpdate removes an optimistic update for a specific torrent
 func (c *Client) clearOptimisticUpdate(hash string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.optimisticUpdates, hash)
+	c.optimisticUpdates.Delete(hash)
 	log.Debug().Int("instanceID", c.instanceID).Str("hash", hash).Msg("Cleared optimistic update")
 }
 

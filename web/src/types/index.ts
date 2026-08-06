@@ -4,10 +4,11 @@
  */
 
 export interface User {
-  id: number
+  id?: number
   username: string
-  createdAt: string
-  updatedAt: string
+  createdAt?: string
+  updatedAt?: string
+  auth_method?: string
 }
 
 export interface AuthResponse {
@@ -21,6 +22,7 @@ export interface Instance {
   host: string
   username: string
   basicUsername?: string
+  tlsSkipVerify: boolean
 }
 
 export interface InstanceFormData {
@@ -30,6 +32,7 @@ export interface InstanceFormData {
   password?: string
   basicUsername?: string
   basicPassword?: string
+  tlsSkipVerify: boolean
 }
 
 export interface InstanceError {
@@ -46,46 +49,81 @@ export interface InstanceResponse extends Instance {
   recentErrors?: InstanceError[]
 }
 
+export interface InstanceCapabilities {
+  supportsTorrentCreation: boolean
+  supportsSetTags: boolean
+  supportsTrackerHealth: boolean
+  supportsTrackerEditing: boolean
+  webAPIVersion?: string
+}
+
+export interface TorrentTracker {
+  url: string
+  status: number
+  num_peers: number
+  num_seeds: number
+  num_leechers: number
+  num_downloaded: number
+  msg: string
+}
+
 export interface Torrent {
+  added_on: number
+  amount_left: number
+  auto_tmm: boolean
+  availability: number
+  category: string
+  completed: number
+  completion_on: number
+  content_path: string
+  dl_limit: number
+  dlspeed: number
+  download_path: string
+  downloaded: number
+  downloaded_session: number
+  eta: number
+  f_l_piece_prio: boolean
+  force_start: boolean
   hash: string
   infohash_v1: string
   infohash_v2: string
-  name: string
-  size: number
-  progress: number
-  dlspeed: number
-  upspeed: number
-  priority: number
-  num_seeds: number
-  num_leechs: number
-  num_complete: number
-  num_incomplete: number
-  ratio: number
-  eta: number
-  state: string
-  category: string
-  tags: string
-  added_on: number
-  completion_on: number
-  tracker: string
-  dl_limit: number
-  up_limit: number
-  downloaded: number
-  uploaded: number
-  downloaded_session: number
-  uploaded_session: number
-  amount_left: number
-  save_path: string
-  completed: number
-  ratio_limit: number
-  seen_complete: number
+  popularity: number
+  private: boolean
   last_activity: number
-  time_active: number
-  auto_tmm: boolean
-  total_size: number
+  magnet_uri: string
   max_ratio: number
   max_seeding_time: number
+  max_inactive_seeding_time?: number
+  name: string
+  num_complete: number
+  num_incomplete: number
+  num_leechs: number
+  num_seeds: number
+  priority: number
+  progress: number
+  ratio: number
+  ratio_limit: number
+  reannounce: number
+  save_path: string
+  seeding_time: number
   seeding_time_limit: number
+  inactive_seeding_time_limit?: number
+  seen_complete: number
+  seq_dl: boolean
+  size: number
+  state: string
+  super_seeding: boolean
+  tags: string
+  time_active: number
+  total_size: number
+  tracker: string
+  trackers_count: number
+  trackers?: TorrentTracker[]
+  tracker_health?: "unregistered" | "tracker_down"
+  up_limit: number
+  uploaded: number
+  uploaded_session: number
+  upspeed: number
 }
 
 export interface TorrentStats {
@@ -96,6 +134,7 @@ export interface TorrentStats {
   error: number
   totalDownloadSpeed?: number
   totalUploadSpeed?: number
+  totalSize?: number
 }
 
 export interface CacheMetadata {
@@ -399,4 +438,48 @@ export interface AppPreferences {
 
   // Add catch-all for any additional fields from the API
   [key: string]: unknown
+}
+
+// Torrent Creation Types
+export type TorrentFormat = "v1" | "v2" | "hybrid"
+export type TorrentCreationStatus = "Queued" | "Running" | "Finished" | "Failed"
+
+export interface TorrentCreationParams {
+  sourcePath: string
+  torrentFilePath?: string
+  private?: boolean
+  format?: TorrentFormat
+  optimizeAlignment?: boolean
+  paddedFileSizeLimit?: number
+  pieceSize?: number
+  comment?: string
+  source?: string
+  trackers?: string[]
+  urlSeeds?: string[]
+  startSeeding?: boolean
+}
+
+export interface TorrentCreationTask {
+  taskID: string
+  sourcePath: string
+  torrentFilePath?: string
+  pieceSize: number
+  private: boolean
+  format?: TorrentFormat
+  optimizeAlignment?: boolean
+  paddedFileSizeLimit?: number
+  status: TorrentCreationStatus
+  comment?: string
+  source?: string
+  trackers?: string[]
+  urlSeeds?: string[]
+  timeAdded: string
+  timeStarted?: string
+  timeFinished?: string
+  progress?: number
+  errorMessage?: string
+}
+
+export interface TorrentCreationTaskResponse {
+  taskID: string
 }
